@@ -1,0 +1,514 @@
+#!/usr/bin/env python
+#Author: Meredith Carpenter
+
+#Goal: Generate a pipeline to analyze fungal species sequences and identify SNP mutations that result in the different color molds
+#Inputs: dgorgon_reference.fa (WT reference sequence), harrington_clinicaldata.txt (clinical sample data), hawkins_pooled_sequences.fastq (pooled fastq data)
+#Outputs: fastqs (with {sample name}_trimmed.fastq files), bams (with {name}.sorted.bam files), report.txt
+
+#Step 1: Read the pooled fastq and output 50 new fastq files that contain only sequences belonging to that sample
+#Method: Using the barcode from the clinical data (harrington_clinicaldata.txt), find the match (at the start of each read), and write the read to its respective file
+#Step 1A: Trim the beginning of the read (remove the barcode and associated quality scores)
+#Step 1B: Remove the ends of the reads with degraded quality (IFF end has at least 2 consecuitve D or F, then remove rest of read)
+#Output from Step 1: 50 fastq files in a folder called fastqs, each in the format of {sample name}_trimmed.fastq (ie tim_trimmed.fastq)
+
+import argparse
+import re
+import os
+import os.path
+import csv
+import shutil
+import glob
+import pysam
+
+####Functions::
+
+#ParseFastQ (class) function definition
+
+class ParseFastQ(object):
+    """Returns a read-by-read fastQ parser analogous to file.readline()"""
+    def __init__(self,filePath,headerSymbols=['@','+']):
+        """Returns a read-by-read fastQ parser analogous to file.readline().
+        Exmpl: parser.next()
+        -OR-
+        Its an iterator so you can do:
+        for rec in parser:
+            ... do something with rec ...
+ 
+        rec is tuple: (seqHeader,seqStr,qualHeader,qualStr)
+        """
+        if filePath.endswith('.gz'):
+            self._file = gzip.open(filePath)
+        else:
+            self._file = open(filePath, 'rU')
+        self._currentLineNumber = 0
+        self._hdSyms = headerSymbols
+         
+    def __iter__(self):
+        return self
+     
+    def next(self):
+        """Reads in next element, parses, and does minimal verification.
+        Returns: tuple: (seqHeader,seqStr,qualHeader,qualStr)"""
+        # ++++ Get Next Four Lines ++++
+        elemList = []
+        for i in range(4):
+            line = self._file.readline()
+            self._currentLineNumber += 1 ## increment file position
+            if line:
+                elemList.append(line.strip('\n'))
+            else: 
+                elemList.append(None)
+         
+        # ++++ Check Lines For Expected Form ++++
+        trues = [bool(x) for x in elemList].count(True)
+        nones = elemList.count(None)
+        # -- Check for acceptable end of file --
+        if nones == 4:
+            raise StopIteration
+        # -- Make sure we got 4 full lines of data --
+        assert trues == 4,\
+               "** ERROR: It looks like I encountered a premature EOF or empty line.\n\
+               Please check FastQ file near line number %s (plus or minus ~4 lines) and try again**" % (self._currentLineNumber)
+        # -- Make sure we are in the correct "register" --
+        assert elemList[0].startswith(self._hdSyms[0]),\
+               "** ERROR: The 1st line in fastq element does not start with '%s'.\n\
+               Please check FastQ file near line number %s (plus or minus ~4 lines) and try again**" % (self._hdSyms[0],self._currentLineNumber) 
+        assert elemList[2].startswith(self._hdSyms[1]),\
+               "** ERROR: The 3rd line in fastq element does not start with '%s'.\n\
+               Please check FastQ file near line number %s (plus or minus ~4 lines) and try again**" % (self._hdSyms[1],self._currentLineNumber) 
+        # -- Make sure the seq line and qual line have equal lengths --
+        assert len(elemList[1]) == len(elemList[3]), "** ERROR: The length of Sequence data and Quality data of the last record aren't equal.\n\
+               Please check FastQ file near line number %s (plus or minus ~4 lines) and try again**" % (self._currentLineNumber) 
+         
+        # ++++ Return fatsQ data as tuple ++++
+        return tuple(elemList)
+
+#bwa_command function definition to execute bwa mam to generate sam files
+
+def bwa_command(bwapath):
+    f = open(bwapath, 'r')
+    bwaname = bwafilename.split('_')[0]
+    mems = "bwa mem " + "sourcefiles/dgorgon_reference.fa " + bwapath + " > " + bwaname + ".sam"
+    os.system(mems)
+
+
+#Define function bam_make that geneartes bam files from the sam files
+
+def bam_make(sampath):
+    s = open(sampath, 'r')
+    bamname = os.path.splitext(sam)[0]
+    bam = "samtools view -bS " + sampath + " > " + bamname + ".bam" 
+    os.system(bam)
+
+#Define function bam_sort that sorts and indexes bam files
+
+def bam_sort(sortpath):
+    b = open(sortpath, 'r')
+    sortedname = os.path.splitext(bams)[0]
+    sorts = "samtools sort -m 100M -o " + sortedname + ".sorted.bam " + sortpath
+    index = "samtools index " + sortedname + ".sorted.bam"
+    os.system(sorts)
+    os.system(index)
+
+#Define pilup function for base count generation; produces SNPReport file
+
+def pileup():
+    #test file, replaced with the sorted.bam you are using. Make sure it is indexed! (Use samtools index yourbam.sorted.bam)
+    samfile = pysam.AlignmentFile(samplepath, "rb")
+
+    #Since our reference only has a single sequence, we're going to pile up ALL of the reads. Usually you would do it in a specific region (such as chromosome 1, position 1023 to 1050 for example)
+    for pileupcolumn in samfile.pileup():
+
+        #Initialize ntdict dictionary to count up the bases (A,T,G,C) at each base position
+        ntdict = {}
+
+        #Initialize counters for each base
+        a_counter = 0
+        t_counter = 0
+        g_counter = 0
+        c_counter = 0
+
+        #Pileup
+        for pileupread in pileupcolumn.pileups:
+            if not pileupread.is_del and not pileupread.is_refskip:
+                base = pileupread.alignment.query_sequence[pileupread.query_position]
+
+                #naive count increase for each counted base
+                if base == 'A':
+                    a_counter += 1
+                elif base == 'T':
+                    t_counter += 1
+                elif base == 'G':
+                    g_counter += 1
+                elif base == 'C':
+                    c_counter += 1
+
+        #ntdict keyed by the sample name and with values of base number and count for each of the nucleotides [0]A , [1]T , [2]G , [3]C
+        ntdict[pileupcolumn.pos] = [a_counter, t_counter, g_counter, c_counter]
+
+        #iterate through the ntdict to determine the percentage of nucleotides at each position
+        for i in ntdict:
+            total = ntdict[i][0] + ntdict[i][1] + ntdict[i][2] + ntdict[i][3]
+
+            #Calculate percentages
+            p_a = float(ntdict[i][0]) / float(total) * 100
+            percent_a = round(p_a,2)
+            p_t = float(ntdict[i][1]) / float(total) * 100
+            percent_t = round(p_t,2)
+            p_g = float(ntdict[i][2]) / float(total) * 100
+            percent_g = round(p_g,2)
+            p_c = float(ntdict[i][3]) / float(total) * 100
+            percent_c = round(p_c,2)
+
+            #Write results to SNPReprt file only if nucleotide percentages are not 100% or 0% (potential SNPs)
+            if percent_a != 100 and percent_a != 0:
+                SNPReport.write("{}\t{}\tA\t{}\n".format(sampname, i, percent_a))
+            if percent_t != 100 and percent_t != 0:
+                SNPReport.write("{}\t{}\tT\t{}\n".format(sampname, i, percent_t))
+            if percent_g != 100 and percent_g != 0:
+                SNPReport.write("{}\t{}\tG\t{}\n".format(sampname, i, percent_g))
+            if percent_c != 100 and percent_c != 0:
+                SNPReport.write("{}\t{}\tC\t{}\n".format(sampname, i, percent_c))
+
+    samfile.close()
+
+#Define function to append values onto an existing dictionary
+
+def append_value(dict_obj, key, value):
+    if key in dict_obj:
+        if not isinstance(dict_obj[key], list):
+            dict_obj[key] = [dict_obj[key]]
+        dict_obj[key].append(value)
+    else:
+        dict_obj[key] = value
+
+#Define function translate for translating DNA sequence to amino acid sequence
+
+def translate(seq):
+    global protein_sequence
+    protein_sequence = ""
+    if len(seq)%3 == 0:
+        # Generate protein sequence ((Break was retained in comment to show how I would normally break the translation for a stop codon))
+        for i in range(0, len(seq)-(3+len(seq)%3), 3):
+            #if protein[seq[i:i+3]] == "_" :
+                #break
+            protein_sequence += protein[seq[i:i+3]]
+    return protein_sequence
+
+##########################################################################
+#####Step 1 main code STARTED######
+
+####Building dictionary from harrington_clinical_data.txt
+#generating empt dictionary clinicaldict to be keyed by barcodes and search fastq pooled file
+clinicaldict = {}
+
+#generating a sub dictionary to just capture the name and color of mold
+molddict = {}
+
+print("Generating dictionaries from pooled fastq file")
+
+#reading in clinical data file to populate dictionary
+with open('sourcefiles/harrington_clinical_data.txt', 'r') as f:
+    reader = csv.reader(f, delimiter='\t')
+    next(reader)
+
+    for row in reader:
+        name = row[0]
+        color = row[1]
+        barcode = row[2]
+        clinicaldict[barcode] = [name, color]
+        molddict[name] = [color]
+
+##Search pooled fastq file for barcodes to separate into individual fastq files
+print("Parsing the pooled fastq file")
+parser = argparse.ArgumentParser()
+parser.add_argument("-f", "--fastq", required=True, help="Place fastq inside here")
+args = parser.parse_args()
+
+fastqfile = ParseFastQ(args.fastq)
+
+#Generate new directory (fastqs) IFF it does not already exist
+mydir = ("fastqs")
+check_folder = os.path.isdir(mydir)
+
+if not check_folder:
+    os.makedirs(mydir)
+
+
+###search fastq_obj[1] for sequence at the beginning of the line
+#read through each fastq_obj
+for fastq_obj in fastqfile:
+
+    #initialize new dictionarys
+    barfind = {}
+    trimmed = {}
+
+    #for each fastq_obj run through each barcode in the clinical dict
+    for i in clinicaldict:
+
+        #generate a unique file titled by the person's name
+        filename = clinicaldict[i][0] + '_trimmed.fastq'
+        filepath = os.path.join('fastqs', filename)
+        f = open(filepath, 'a')
+
+        #if the sequnce (fastq_obj[1]) begins with the barcode, add the barcode to the 'trimmed' dictionary
+        if fastq_obj[1].startswith(i):
+            barfind[i] = [fastq_obj[0],fastq_obj[1],fastq_obj[3]]
+
+            #for each new entry in the barfind dictionary
+            for seq in barfind:
+                trimseq = barfind[i][1][len(i):] #trim the barcode from the sequence 
+                trimqual = barfind[i][2][len(i):] #trim the equivalent number from the quality read
+                finqual = re.split(r'(DF|FD|FF|DD)', trimqual)[0] #split the quality read by the requested delimiter (with 'or' conditionals) and return only the quality read (before the delimiter)
+                finseq = trimseq[0:len(finqual)] #return the same length sequence (as the quality read) counting from the start of the string
+
+                trimmed[seq] = [barfind[i][0], finseq, finqual] #save to new dictionary of trimmed seq and quals keyed by the sequenceID
+
+                #write the results to the generated file
+                f.write("{}\n{}\n{}\n{}\n".format(trimmed[seq][0], trimmed[seq][1], fastq_obj[2], trimmed[seq][2]))
+        f.close()
+
+####STEP 1 COMPLETE#####
+####STEP 2 STARTED#######
+
+# Step 2: Perform alignment on each FASTQ to the reference sequence (dgorgon_reference.fa)
+# Method: Call the bwa command to transform the FASTQs to samfiles
+# Output: {name}.sam
+
+#Index the reference file dgorgon_reference.fa
+indx = "bwa index 'sourcefiles/dgorgon_reference.fa'"
+os.system(indx)
+
+#read in all fastq files from the fastqs directory and apply the bwa_command function to generate {name}.sam files
+directory = r'fastqs'
+
+print("Running bwa mem sourcefiles/dgorgon_reference.fa bwapath > bwaname.sam")
+for bwafilename in os.listdir(directory):
+    bwapath = os.path.join(directory, bwafilename)
+    bwa_command(bwapath)
+
+#####STEP 2 COMPLETE####
+#####STEP 3 STARTED######
+
+#Step 3: Convert the sam files to bam files with the samtools view, place {name}.sorted.bam files in directory bams
+
+#Generate new directory bams IFF it does not exist
+bamdir = ("bams")
+check_folder = os.path.isdir(bamdir)
+
+if not check_folder:
+    os.makedirs(bamdir)
+
+#Exectue bam_make function for each .sam file in the current directory
+print("Generating .bam files from .sam files: samtools view -bS sampath > bamname.bam")
+for sam in os.listdir('.'):
+    if sam.endswith(".sam"):
+        sampath = os.path.join('.', sam)
+        bam_make(sampath)
+
+#Exectue bam_sort for each .bam file in the current directory
+print("Sorting .bam files: samtools sort -m 100M -o sortedname.sorted.bam sortpath")
+print("Indexing .sorted.bam files: samtools index sortedname.sorted.bam")
+for bams in os.listdir('.'):
+    if bams.endswith(".bam"):
+        bampath = os.path.join(".", bams)
+        bam_sort(bampath)
+
+#Move indexed .bam.bai files to the bams directory
+for bambai in os.listdir('.'):
+    if ".sorted" in bambai:
+        source = os.path.join('.', bambai)
+        destination = os.path.join('bams', bambai)
+        dest = shutil.move(source, destination)
+
+#Glob the .bam and .sam files needing to be removed and remove them
+bfiles = glob.glob('./*.bam')
+sfiles = glob.glob('./*.sam')
+
+for bf in bfiles:
+    os.remove(bf)
+
+for sf in sfiles:
+    os.remove(sf)
+
+#####STEP 3 COMPLETE####
+#####STEP 4 STARTED######
+
+#Step 4: Use the python pysam pileup function to discover variants in each sorted bam file
+#Specifically looking to find what position along the reference has a SNP mutation
+#If a position contains nucleotide other than WT (from reference) it is considered a SNP and reported
+
+#Execute the pileup function to generate file containing sample names, base position, base and nucleotide percentage
+print("Executing pileup to generate temporary file containing sample names, base positions, base and nucleotide percentages")
+SNPReport = open("SNPReport.txt", "w")
+
+for samples in os.listdir('bams'):
+    if samples.endswith(".bam"):
+        samplepath = os.path.join('bams', samples)
+        sampname = samples.split('.')[0]
+        pileup()
+
+SNPReport.close()
+
+#Read in both the reference sequence and the SNPReport to compare and determine SNPs
+#Reading reference sequence in as a string:
+with open('sourcefiles/dgorgon_reference.fa', 'r') as f:
+    refstr = f.readlines()[1]
+
+#initializing preSNP dictionary
+preSNPSdict = {}
+
+#reading in clinical data file as a csv with tab delimiter to generate preSNPSdict
+with open('SNPReport.txt', 'r') as f:
+    reader = csv.reader(f, delimiter='\t')
+    for row in reader:
+        key = row[0]+row[1]+row[2]
+        preSNPSdict[key] = [row[0],row[1],row[2],row[3]]
+
+#initializing SNP dictionary
+SNPSdict = {}
+
+print("Determining SNPs")
+#looping through preSNPSdict to find entries where sample base is not equal to WT base and therefore a SNP. Adding only these entries to new dictionary
+for i in preSNPSdict:
+    bpos = int(preSNPSdict[i][1])
+    if preSNPSdict[i][2] != refstr[bpos]:
+        SNPSdict[preSNPSdict[i][0]] = [preSNPSdict[i][1], preSNPSdict[i][2], preSNPSdict[i][3], refstr[bpos]]
+
+#Remove the temporary SNPReport file
+os.remove("SNPReport.txt")
+
+#####Accumulating data into a single dictionary for generating the final report####
+
+#Calculate the number of reads for each person and add to dictionary keyed by sample name
+#Initialize count dictionary
+cntdict = {}
+
+for cnts in os.listdir('fastqs'):
+    cntpath = os.path.join('fastqs', cnts)
+    cntname = cnts.split('_')[0]
+    file = open(cntpath, "r")
+    cnter = 0
+    Content = file.read()
+    CoList = Content.split("\n")
+    for i in CoList:
+        if '@' in i:
+            cnter += 1
+    cntdict[cntname] = [cnter]
+
+#append the mold dictionary {[name] = [color, #reads]} with the count dictionary {[name] = [counts]}
+for i in molddict:
+    for j in cntdict:
+        if i == j:
+            append_value(molddict, i, cntdict[j][0])
+
+#append the SNP dictionary with the contents of the mold dictionary to make one comprehensive dictionary with all given and derived information
+for i in SNPSdict:
+    for j in molddict:
+        if i == j:
+            append_value(SNPSdict, i, molddict[j][0])
+            append_value(SNPSdict, i, molddict[j][1])
+
+####Final SNPdictionary contains the following information:
+##Keyed by sample name: [0] base position number, [1] SNP base, [2] % read of the mutant base, [3] WT base at that bp, [4] color, [5] total number of reads
+
+#####STEP 4 COMPLETE####
+#####STEP 5 STARTED######
+
+#Step 5: Creates a report (report.txt) that outputs what nucleotide poisiton and mutation is responsible for each color of the mold.
+#Also prints the number of sequences that were used for each sample.
+
+print("Generating final report")
+#Open output file
+report = open("report.txt", 'w')
+
+#Initializing new dictionary to extract mold data
+moldcomp = {}
+
+report.write("The following report outputs what nucleotide position and mutation is responsible for each color of mold.\n\n")
+
+#Generating a dictionary of mold SNPs keyed by color: [base position number, wild type base, SNP base]
+for i in SNPSdict:
+    if SNPSdict[i][4] == 'Black':
+        moldcomp[SNPSdict[i][4]] = [SNPSdict[i][0], SNPSdict[i][3], SNPSdict[i][1]]
+    if SNPSdict[i][4] == 'Green':
+        moldcomp[SNPSdict[i][4]] = [SNPSdict[i][0], SNPSdict[i][3], SNPSdict[i][1]]
+    if SNPSdict[i][4] == 'Orange':
+        moldcomp[SNPSdict[i][4]] = [SNPSdict[i][0], SNPSdict[i][3], SNPSdict[i][1]]
+    if SNPSdict[i][4] == 'Yellow':
+        moldcomp[SNPSdict[i][4]] = [SNPSdict[i][0], SNPSdict[i][3], SNPSdict[i][1]]
+
+##The {color} mold was caused by a mutation in position {number}. The wildtype base was {reference base} and the mutation was {mutation base}.
+for i in moldcomp:
+    report.write("The {} mold was caused by a mutation in position {}. The wildtype base was {} and the mutation was {}\n".format(i, moldcomp[i][0], moldcomp[i][1], moldcomp[i][2]))
+
+report.write("\nIt also provides information on the read counts and percentage reads of each individual.\n\n")
+
+#Sample {name} had a {color} mold, {number} reads, and {percentage} of the reads at position {number} had the mutation {mutation base}.
+for i in SNPSdict:
+    report.write("Sample " + str(i) + " had a(n) " + str(SNPSdict[i][4]) + " mold, " + str(SNPSdict[i][5]) + " reads, and " + str(SNPSdict[i][2]) + "%" + " of reads at position " + str(SNPSdict[i][0]) + " had the mutation " + str(SNPSdict[i][1]) + "\n")
+
+
+
+####EXTRA STEP: TRANSLATING DNA AND DETERMINING MUTATION TYPE#####
+##GOAL: Determine the protein sequence (AA) of the wildtype dgorgon
+##Use the SNPs for each mold (generated in the previous steps) to alter the DNA sequence and re-translate in order to understand resulting mutations.
+##TO BE CLEAR: Because this is not a true exon, the read was not started at a start codon and translation was intentionally contined through stop codons (otherwise this task would have been too short)
+##Translation was proccessed straight through the entire DNA sequence. 
+##Results reported: original amino acid at SNP site, mutated amino acid at SNP site, and type of mutation (silent, missense, nonsense)
+
+#Codon chart 
+protein = {
+    #'M' - Start, '_' - Stop
+    'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M', 
+    'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T', 
+    'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K', 
+    'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R', 
+    'CTA':'L', 'CTC':'L', 'CTG':'L', 'CTT':'L', 
+    'CCA':'P', 'CCC':'P', 'CCG':'P', 'CCT':'P', 
+    'CAC':'H', 'CAT':'H', 'CAA':'Q', 'CAG':'Q', 
+    'CGA':'R', 'CGC':'R', 'CGG':'R', 'CGT':'R', 
+    'GTA':'V', 'GTC':'V', 'GTG':'V', 'GTT':'V', 
+    'GCA':'A', 'GCC':'A', 'GCG':'A', 'GCT':'A', 
+    'GAC':'D', 'GAT':'D', 'GAA':'E', 'GAG':'E', 
+    'GGA':'G', 'GGC':'G', 'GGG':'G', 'GGT':'G', 
+    'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S', 
+    'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L', 
+    'TAC':'Y', 'TAT':'Y', 'TAA':'_', 'TAG':'_', 
+    'TGC':'C', 'TGT':'C', 'TGA':'_', 'TGG':'W', 
+    }
+
+#Reading in the sourcefile and trimming the length of the sequence to be a multiple of 3
+with open('sourcefiles/dgorgon_reference.fa', 'r') as f:
+    seq = f.readlines()[1]
+    seq = seq.replace("\n", "")
+    seq = seq.replace("\r", "")
+    if len(seq)%3 == 1:
+        seq = seq[:-1]
+    elif len(seq)%3 == 2:
+        seq = seq[:-2]
+
+#Defining variable
+protein_sequence = ""
+
+#Translating the reference sequence
+oldaa = translate(seq)
+
+#Genearting information to the report
+report.write("\n\nThe protein (amino acid) sequence generated from the dgorgon reference sequence is:\n" + str(translate(seq) + "\n\n"))
+
+##Cycle through moldcomp dictionary developed in earlier steps to check effects of each SNP
+for i in moldcomp:
+    bpos = int(moldcomp[i][0])
+    newb = moldcomp[i][2]
+    newseq = seq[:bpos] + newb + seq[bpos+1:]
+    newaa = translate(newseq)
+    for j in range(len(newaa)):
+        if newaa[j] != oldaa[j]:
+            report.write("The {} mold SNP at base position {} produces a missense mutation, changing amino acid {} to {}\n".format(i, moldcomp[i][0], oldaa[j], newaa[j]))
+        if newaa[j] != oldaa[j] and newaa[j] == '_':
+            report.write("The {} mold SNP at base position {} produces a nonsense mutation, changing amino acid {} to a stop codon\n".format(i, moldcomp[i][0], oldaa[j]))
+        if newaa == oldaa:
+            report.write("The {} mold SNP at base position {} produces a silent mutation, resulting in the amino acid remaining {}\n".format(i, moldcomp[i][0], oldaa[j]))
+
+report.close()
