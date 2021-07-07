@@ -1,4 +1,4 @@
-# Sample-Pipeline
+# SNP Pipeline
 
 #Author: Meredith Carpenter
 
